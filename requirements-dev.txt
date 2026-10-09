@@ -1,0 +1,5 @@
+# Everything needed to run the pipeline AND its tests.
+-r requirements.txt
+
+pytest>=8.0
+tzdata>=2024.1   # IANA timezone data for zoneinfo (Windows ships none); used by the independent test oracle

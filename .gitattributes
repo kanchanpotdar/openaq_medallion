@@ -1,0 +1,12 @@
+# Normalise line endings: store text as LF in the repository regardless of who commits it.
+# (This only affects how Git stores and checks out files; it does not edit working-tree contents.)
+* text=auto eol=lf
+
+*.py   text eol=lf
+*.sql  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.csv  text eol=lf
+*.txt  text eol=lf
+*.ini  text eol=lf

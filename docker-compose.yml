@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: openaq_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Named volume: data survives `docker compose down`; wiped only by `down -v`.
+      - pgdata:/var/lib/postgresql/data
+      # Runs ONLY on first start of an empty volume; apply the other db/*.sql files with `python -m pipeline.apply_sql`.
+      - ./db/00_schemas.sql:/docker-entrypoint-initdb.d/00_schemas.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

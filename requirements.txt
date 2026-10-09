@@ -1,0 +1,4 @@
+# Runtime dependencies only. Python 3.11+. Test-only packages live in requirements-dev.txt.
+psycopg[binary]>=3.2,<4   # PostgreSQL driver (psycopg 3)
+requests>=2.32            # OpenAQ REST API calls
+python-dotenv>=1.0        # load .env

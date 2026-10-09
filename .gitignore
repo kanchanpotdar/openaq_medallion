@@ -1,0 +1,24 @@
+# --- secrets / local configuration -------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Python ------------------------------------------------------------------
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# --- generated data, logs and leftovers --------------------------------------
+data/*
+!data/.gitkeep
+data/logs/
+*.log
+*.bak
+pgdata/
+
+# --- editors / operating systems ---------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
