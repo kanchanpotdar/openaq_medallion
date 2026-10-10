@@ -80,7 +80,7 @@ Each entry is something that is actually implemented. Format: **decision → why
 
 ## 16. Failure tolerance
 * **Decision.** A sensor whose request fails after retries is recorded and the run continues; the run fails if more than `--max-failed-fraction` (default 5 %) of attempted sensors fail. Any other exception aborts the run.
-* **Why.** A handful of persistently failing sensors should not block the pipeline, but they must be visible and bounded. Swallowing every exception per sensor would hide database errors, so only `FetchError` is tolerated.
+* **Why.** A handful of persistently failing sensors should not block the pipeline, but they must be visible and bounded. Swallowing every exception per sensor would hide database errors, so only `FetchError` is tolerated. HTTP 408 is classified as a timeout and retried like any other transient failure (see 20 for why that alone was not enough).
 
 ## 17. Advisory locking
 * **Decision.** A session advisory lock for the whole run, transaction-level locks for Silver and Gold (Gold takes Silver's first), and a unique partial index so the database allows only one `RUNNING` run.
@@ -92,3 +92,11 @@ Each entry is something that is actually implemented. Format: **decision → why
 ## 19. Tests that can fail
 * **Decision.** The suite runs on an isolated database, uses a scripted fake API with the real client, includes an independent Python oracle for Gold, and is mutation-tested (rules are deliberately broken to confirm the tests notice).
 * **Why.** A validation layer that always reports "all clean" looks identical to one that is broken; dirty fixtures and mutation checks are what prove the rules fire.
+
+## 20. Fetch each sensor's window in 30-day time slices
+* **Context.** The 90-day load left four sensors incomplete: page 5-7 of a 90-day request returned HTTP 408 (Request Timeout). Treating 408 as retryable was correct but did not fix it: a re-fetch got 408 on all five attempts, because the API paginates by offset and deep pages are deterministically slow. Direct API calls confirmed that the same rows come back quickly as shallow pages of a smaller window.
+* **Decision.** Split each sensor's requested window into consecutive slices of at most 30 days (2-3 pages each). Every slice after the first starts one hour early.
+* **Why it is safe.** The row hash depends only on content, never on the request, so an overlapping row is skipped as already present (no duplicate Bronze row, verified against five hypothetical API boundary rules, because the real rule is undocumented). The run still records the overall requested window; `fetch_attempts` records the slices.
+* **Trade-off.** A few rows per slice boundary are fetched twice (27 extra rows across four sensors in the corrective run). A failing slice fails the sensor immediately rather than trying its later slices, which bounds the cost of sensors that always error.
+* **Result.** The corrective run fetched the four sensors with 35 requests, all HTTP 200, deepest page 3, and recovered 3,442 rows; sensor 12235391 went from 4,336 to 5,781 rows, exactly what the API holds for it.
+* **Where.** `pipeline/ingest_bronze.py` (`time_slices`, `SLICE_DAYS`, `SLICE_OVERLAP`), `tests/test_slicing.py`.

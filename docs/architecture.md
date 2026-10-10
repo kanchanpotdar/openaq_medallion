@@ -41,7 +41,7 @@ Describes what is implemented today. Numbers from a specific run are intentional
 
 1. Acquire a session-level advisory lock (`audit.run_all`). If it is held, stop with `PipelineBusy`. Mark any stale `RUNNING` row (a crashed process) as `FAILED (abandoned)`.
 2. Insert the run row (`RUNNING`) with the **requested window** exactly as given.
-3. **Bronze** — discover India PM2.5 sensors, snapshot them, then fetch each sensor's measurements for the window. Every HTTP attempt is recorded (`fetch_attempts`) and every sensor ends with a status (`sensor_fetch_status`). Only `FetchError` is treated as a per-sensor failure; any other exception aborts the run.
+3. **Bronze** — discover India PM2.5 sensors, snapshot them, then fetch each sensor's measurements for the window **in time slices of at most 30 days** (see "Fetching long windows"). Every HTTP attempt is recorded (`fetch_attempts`) and every sensor ends with a status (`sensor_fetch_status`). Only `FetchError` is treated as a per-sensor failure; any other exception aborts the run.
 4. **Silver** — `silver.run_silver(run_id)` classifies Bronze rows that have no verdict yet (`NOT EXISTS`, not a high-water mark) and recomputes soft flags for touched sensors.
 5. **Gold** — the requested window is widened just enough to cover Silver data (the API returns periods that overlap the window edge) and passed to `gold.run_gold(run_id, horizon…)`.
 6. **Reconcile** — `audit.reconcile(run_id, stats)` returns the checks. If any `CRITICAL` check fails, the Silver/Gold transaction is **rolled back**; otherwise it commits.
@@ -64,8 +64,15 @@ Describes what is implemented today. Numbers from a specific run are intentional
 | Silver | Only unclassified Bronze rows are processed; `--full-refresh` rebuilds from Bronze. |
 | Gold | Full recompute into temporary tables, then diff-based upsert (`IS DISTINCT FROM`) and delete of stale keys. A rerun with unchanged data writes zero rows and leaves `gold_run_id` untouched. |
 
+## Fetching long windows (time slices)
+
+The OpenAQ API paginates by offset, so deep pages of a long window get slow and eventually time out with **HTTP 408**. In the 90-day run, four sensors stopped early on page 5-7 of a 90-day request. Retrying did not help (the same page timed out on every attempt); the rows were retrievable as shallow pages in a smaller window.
+
+Each sensor's window is therefore fetched as consecutive slices of at most 30 days (`time_slices` in `pipeline/ingest_bronze.py`), so every request needs only 2-3 pages. Every slice after the first starts one hour early, so a period straddling a boundary cannot fall between two slices whatever the API's inclusive/exclusive boundary rule is. The overlap re-fetches a few identical rows, which the content hash skips; no duplicate Bronze row is created. The run still records the overall requested window; `audit.fetch_attempts` records each slice. A slice that fails after all retries fails the sensor and the failure names the slice.
+
 ## Failure model
 
+* Transient failures are retried: HTTP 5xx, **408 (classified as a timeout)**, 429, client-side timeouts, network errors and unparseable bodies. Other 4xx responses are final.
 * A sensor whose request cannot be completed is **recorded** (`FAILED`, with every attempt) and the run continues; the run fails only if the failure rate exceeds `--max-failed-fraction` (default 5 %).
 * Silver and Gold failures (including the in-database guards) roll back and are recorded as `FAILED` with the failing stage.
 * The API key is sent only in a header; the client and the audit writer both redact it from anything stored or logged.

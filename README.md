@@ -7,8 +7,10 @@ reconciliation check) for each run.
 
 Stack: Python · PostgreSQL 16 · SQL (CTEs, window functions) · Docker Compose · pytest
 
-> **Status.** The pipeline and its tests are complete and have been run end to end on a 7-day window (results below).
-> A 90-day production-scale run is in progress; its figures will be added to this README when it finishes.
+> **Status: complete and validated at production scale.** It has been run end to end on a 90-day window
+> (**3.3 million raw measurements**, 559 sensors with data, a 6.5 GB database) with 201 automated tests passing and
+> every reconciliation check green. See [Production-scale validation](#production-scale-validation) and
+> [Completeness: what is and is not claimed](#completeness-what-is-and-is-not-claimed).
 
 ---
 
@@ -23,6 +25,8 @@ It is built to show data-engineering fundamentals on real, messy data rather tha
 * **Data quality as code** — explicit hard rules, soft flags, and a verdict for every raw row.
 * **Idempotent, safely re-runnable** processing at every layer.
 * **Reconciliation** — 25 durable checks; a failed critical check fails the run and rolls back Silver and Gold.
+* **Operating at scale** — a real production issue (deterministic API timeouts on deep pages) was diagnosed from the
+  audit trail, fixed, and verified, as described below.
 * **Tests that can fail** — isolated test database, scripted fake API, an independent Python oracle, and mutation testing.
 
 ---
@@ -31,7 +35,7 @@ It is built to show data-engineering fundamentals on real, messy data rather tha
 
 ```text
                        OpenAQ v3 API   (India · PM2.5 · parameter 2 · country id 9)
-                                │  X-API-Key header · retries · rate-limit handling
+                                │  X-API-Key header · retries · rate-limit handling · 30-day request slices
                                 ▼
  ┌────────────────────────────────────────────────────────────────────────────────────┐
  │  pipeline/run_all.py        one run_id for the whole run                           │
@@ -69,6 +73,7 @@ Things the data taught the design (all observed, see [docs/decisions.md](docs/de
 * **Overlapping window edges** — the API returns periods that begin slightly before the requested window.
 * **Timezone** — all locations are `Asia/Kolkata` (UTC+5:30), so daily summaries use the local date, not the UTC date.
 * **Missing metadata** — `locality` is null for almost every location, so Gold aggregates by location, not city.
+* **Offset pagination** — deep result pages of a long window get slow and time out (see below).
 * **Source gaps** — some providers stop delivering earlier than others, and a small set of sensors reproducibly returns HTTP 500.
 
 ---
@@ -81,6 +86,26 @@ Things the data taught the design (all observed, see [docs/decisions.md](docs/de
   followed by `INSERT … ON CONFLICT DO NOTHING`, so reloading an overlapping window inserts nothing. Volatile fields are
   kept out of the hash.
 * A trigger rejects `UPDATE` and `DELETE`: source evidence is never edited.
+
+### Fetching long windows: 30-day time slices
+
+The first 90-day load exposed a real scale problem. The API paginates by **offset**, so page 5-7 of a 90-day request takes
+about 7 seconds and is cut off with **HTTP 408 (Request Timeout)**:
+
+1. Four sensors stopped early, each failing on a deep page. The audit trail (`fetch_attempts`) showed exactly which
+   request, page and duration.
+2. The client was changed to treat 408 as a **transient timeout and retry it** (it had been classified as a final client
+   error).
+3. **Retrying alone did not help.** A targeted re-fetch got 408 on all five attempts of the same page: the slowness is
+   deterministic, not transient.
+4. Direct API calls showed that the same rows come back quickly as shallow pages of a smaller window.
+5. **Fix:** each sensor's window is fetched in consecutive slices of at most 30 days (2-3 pages each). Every slice after the
+   first starts **one hour early**, so a period straddling a boundary cannot fall between two slices whatever the API's
+   inclusive/exclusive rule is. The overlap re-fetches a few identical rows, which the existing content hash skips, so no
+   duplicate Bronze row is created. The run still records the overall requested window; `fetch_attempts` records each slice.
+
+Result: the corrective run fetched the four sensors with 35 requests, all HTTP 200 (deepest page 3, slowest 4.8 s), and
+recovered **3,442 rows**; one sensor went from 4,336 to 5,781 rows, exactly the number the API holds for it.
 
 ## Silver — validated, typed, deduplicated
 
@@ -122,7 +147,7 @@ comparable because coverage is measured in **seconds**; flatline readings stay i
 | Table / view | Answers |
 |---|---|
 | `audit.pipeline_runs` | what was **requested** (exact window), what horizon Gold used, what the API returned, timings, counts per layer, status |
-| `audit.fetch_attempts` | every HTTP attempt: outcome (`SUCCESS`, `HTTP_5XX`, `RATE_LIMITED`, `TIMEOUT` …), status code, backoff |
+| `audit.fetch_attempts` | every HTTP attempt: outcome (`SUCCESS`, `HTTP_5XX`, `RATE_LIMITED`, `TIMEOUT` …), status code, backoff, and the (sliced) window requested |
 | `audit.sensor_fetch_status` | each sensor's fate in a run: `FETCHED`, `ZERO_ROWS`, `FAILED`, `SKIPPED_INACTIVE`, `NOT_ATTEMPTED` |
 | `audit.reconciliation_checks` | the 25 checks, expected vs actual |
 | `audit.v_no_data_reason` | *why* a sensor-day has no data — fetch failed, source returned nothing, skipped, or the provider/sensor stopped |
@@ -174,11 +199,14 @@ python -m pipeline.apply_sql
 ## Running the pipeline
 
 ```bash
-# a pinned 7-day window (reproducible)
+# a pinned 7-day window (reproducible; about half an hour)
 python -m pipeline.run_all --days 7 --end 2026-10-09T00:00:00Z
 
-# the last 7 days up to now
-python -m pipeline.run_all --days 7
+# the 90-day window used for the results below (about four hours, rate-limited by the API)
+python -m pipeline.run_all --days 90 --end 2026-10-09T00:00:00Z
+
+# re-fetch specific sensors for the same window (idempotent; existing rows are skipped by hash)
+python -m pipeline.run_all --days 90 --end 2026-10-09T00:00:00Z --sensor-id 12235391
 ```
 
 | Option | Meaning |
@@ -188,9 +216,7 @@ python -m pipeline.run_all --days 7
 | `--max-failed-fraction F` | fail the run if more than this share of attempted sensors fail (default `0.05`) |
 
 Exit codes: `0` success · `1` failed (details in `audit.pipeline_runs`) · `3` another run is in progress.
-The API is rate-limited, so a window with many data-bearing sensors takes a while (the 7-day run below took about
-27 minutes). Layers can also be run alone: `python -m pipeline.run_silver [--full-refresh]`,
-`python -m pipeline.run_gold`.
+Layers can also be run alone: `python -m pipeline.run_silver [--full-refresh]`, `python -m pipeline.run_gold`.
 
 Look at the result:
 
@@ -226,15 +252,17 @@ pytest            # runs against a throw-away `openaq_test` database
 > The tests create and **drop** a database named `openaq_test` on the server configured in `.env` (they refuse to run
 > if that name equals your configured database). Postgres must be running.
 
-* **176 tests** across Silver rules and flags, Gold hourly/daily/health, run-level behaviour (idempotency, rollback,
-  concurrency, guards) and the audit layer.
+* **201 tests** across Silver rules and flags, Gold hourly/daily/health, run-level behaviour (idempotency, rollback,
+  concurrency, guards), the audit layer, and the 30-day slicing.
 * **Dirty fixtures** — a CSV with one row per hard rule, duplicates and priority cases is the executable spec of the Silver rules.
-* **Scripted fake API** injected into the real HTTP client, so retry/classification/audit code runs without network.
+* **Scripted fake API** injected into the real HTTP client, so retry/classification/audit/slicing code runs without network.
+  The fake can apply five different boundary rules to a requested window, so the slicing is tested against every plausible
+  API behaviour.
 * **Independent oracle** — `tests/oracle.py` re-implements the Gold formulas in plain Python (`Decimal` + `zoneinfo`)
   and compares **every row**: `python -m tests.oracle --dbname <database>`.
-* **Mutation testing** — the SQL and orchestration were deliberately broken one change at a time (e.g. `>` → `>=`,
-  disabled rules, dropped locks) and the suite was confirmed to fail each time: 11/11 Silver, 20/20 Gold and 22/22
-  audit mutations were caught.
+* **Mutation testing** — the SQL and code were deliberately broken one change at a time (e.g. `>` → `>=`, disabled rules,
+  dropped locks, removed slice overlap) and the suite was confirmed to fail each time: **11/11 Silver, 20/20 Gold,
+  22/22 audit and 10/10 slicing** mutations were caught.
 
 ---
 
@@ -261,53 +289,93 @@ docker exec -i openaq_postgres psql -U openaq -d openaq < sql/showcase/01_data_q
 
 ## Results
 
-Measured on a **7-day window (2026-10-02 → 2026-10-09 UTC)**, run end to end through `pipeline.run_all` against the real API:
+Two end-to-end runs through `pipeline.run_all` against the real API:
 
-| Metric | 7-day run |
+| Metric | 7-day run (2026-10-02 → 10-09) | 90-day run (2026-07-11 → 10-09) |
+|---|---|---|
+| Sensors discovered / skipped inactive / attempted | 1,067 / 211 / 856 | 1,067 / 185 / 882 |
+| Sensors that failed to fetch | 15 | 19 in the first pass; **15** after the slicing fix (4 recovered) |
+| Sensors with data | 543 | **559** |
+| Bronze measurement rows | 209,009 | **3,315,213** (the 7-day rows are a subset) |
+| Silver `VALID` / `REJECTED` / `DUPLICATE` | 209,009 / 0 / 0 | **3,315,208 / 5 / 0** |
+| Silver soft flags | 2,289 flatline · 1,084 long-gap · 15 high-value | 50,799 flatline · 6,071 long-gap · 877 high-value |
+| Gold hourly / daily / health rows | 58,326 / 3,182 / 8,536 | **954,904 / 45,889 / 97,097** |
+| Reconciliation checks (per run: 25) | 24 pass · 1 warning · 0 fail | main run 24 pass · 1 warning · 0 fail; corrective run **25/25 pass** |
+| Run time | ~27 min | ~3 h 56 min main run (rate-limited API) + 4 min corrective re-fetch |
+| Database size | 429 MB | **6,551 MB** (Bronze 4.8 GB, Silver 1.5 GB, Gold 0.25 GB) |
+
+Gold on the 90-day data: 559 locations; 45,889 location-days of which 31,748 (69 %) meet the 75 % completeness bar and
+539 are partial edge days; 954,904 sensor-hours of which 754,190 are fully covered. Sensor-day health:
+52.7 % `NO_DATA`, 21.9 % `PARTIAL`, 19.9 % `OK`, 5.2 % `LOW_COVERAGE`, 0.3 % `STUCK` — and every `NO_DATA` day carries a
+reason (see below).
+
+## Production-scale validation
+
+| Check | Result |
 |---|---|
-| Sensors discovered / skipped inactive / attempted / failed | 1,067 / 211 / 856 / 15 |
-| Bronze measurement rows | 209,009 |
-| Silver `VALID` / `REJECTED` / `DUPLICATE` | 209,009 / 0 / 0 |
-| Silver soft flags | 2,289 flatline · 1,084 long-gap · 15 high-value |
-| Gold hourly / daily / health rows | 58,326 / 3,182 / 8,536 |
-| Reconciliation checks | 25 run — 24 passed, 1 warning (the 15 failed sensors, 1.75 % of attempted), 0 failed |
-| Re-run over the same window | Bronze 0 inserted · Silver 0 classified · Gold 0 rows written; layer checksums unchanged |
-| Run time | ~27 minutes (rate-limited API) |
-| Independent oracle vs Gold | 0 mismatches across all 70,044 rows |
+| Rows processed | **3,315,213** Bronze → **3,315,208** Silver VALID (+ 5 rejected, 0 duplicate) → 954,904 / 45,889 / 97,097 Gold rows |
+| Sensors with data | **559** (of 1,067 discovered) |
+| Database size | **6,551 MB** |
+| Automated tests | **201** passing |
+| Mutation tests (slicing) | **10/10** caught |
+| Reconciliation | **25/25** checks pass on the corrective run; the main run's only non-pass was the tolerated fetch-failure warning |
+| Rows recovered by 30-day slicing | **3,442** across 4 sensors; all targeted API requests then succeeded (35/35, deepest page 3) |
+| Duplicate natural keys | **0** in Bronze and in Silver |
+| Bronze immutability | the 3,311,771 rows that existed before the corrective run are byte-identical afterwards (checksum), and content outside the four affected sensors is unchanged in every layer |
+| Independent oracle | 0 mismatches across all Gold rows on the 7-day data (70,044 rows) |
+| Silver + Gold + reconciliation at ~3.3M rows | ~12 minutes (Gold is a full recompute, so its cost scales with total Silver rows) |
 
-What the audit trail showed on this data:
+## Completeness: what is and is not claimed
 
-* The 15 failing sensors are the same every time (HTTP 500 for all of them); they are recorded as `FETCH_FAILED`, not
-  mistaken for silent sensors.
-* One further sensor returned a 500 once and succeeded on retry, which was visible in `fetch_attempts`.
-* One provider's feed ends about 33.5 hours before the window end; this is attributed to the **provider**
-  (`PROVIDER_STOPPED_DELIVERING`), not to individual sensors.
+These four things are deliberately kept separate, because a pipeline can be complete without the source being complete.
 
-**90-day run:** in progress. Its row counts, runtime, failure distribution and database size will be added here once it
-has finished and been verified.
+* **Pipeline completeness (claimed, and verified).** Every measurement the API returned for the requested window is in
+  Bronze, every Bronze row has exactly one Silver verdict, and every Gold layer sums back to Silver. This is checked by 25
+  reconciliation checks per run, and each of the 1,067 discovered sensors has a recorded fetch outcome.
+* **Source completeness (not claimed).** The pipeline holds what the API provides, not necessarily everything that was
+  measured. 308 sensors returned zero rows for the window, 185 were skipped because the source reports them inactive, and
+  many sensors have gaps within their history; these are visible as `NO_DATA` and low-coverage days rather than hidden.
+* **Known source/API failures (a limitation).** **15 sensors** (12 under a provider named "N/A", 3 under CPCB) return
+  HTTP 500 on every attempt, and have done so in every run so far. They are recorded as `FETCH_FAILED` in the audit trail
+  (not mistaken for silent sensors) and tolerated within the 5 % failure budget. Their data is not in the dataset.
+* **Provider freshness (a limitation).** The CPCB feed — and the "N/A" provider — ends at **2026-10-07 14:30 UTC, about
+  33.5 hours before the window end**, so those sensors show no data for the final day and a half. The audit trail
+  attributes this to the **provider** (`PROVIDER_STOPPED_DELIVERING`), not to individual sensors. AirGradient, AirNow and
+  Clarity are current to within 0.5 hours.
+
+## Data-quality finding: five rejected source rows
+
+Over 3.3 million rows the Silver rules rejected exactly **5**, all genuine source anomalies, each with its reason and raw
+value recorded in `silver.rejected_records`:
+
+* one reading of **−4.0 µg/m³** from an AirNow sensor → `NEGATIVE_PM25`;
+* four consecutive 15-minute periods with a **NULL value** from one sensor → `MISSING_VALUE`.
+
+The 7-day window contained none of these; the larger window surfaced them. No row was duplicated (0 `DUPLICATE`).
 
 ---
 
 ## Known limitations
 
-* **Retry coverage.** The client retries 5xx, 429, timeouts, network errors and unparseable bodies, but treats every
-  other 4xx — including `408 Request Timeout` — as non-retryable. A 408 on a deep results page ends that sensor's fetch
-  early (the pages already loaded are kept and the failure is recorded). Treating 408 as retryable is a planned fix.
-* **Persistent source errors.** A small, deterministic set of sensors returns HTTP 500 and cannot be loaded; they are
-  recorded and tolerated up to the failure threshold, not recovered.
+* **Source gaps.** See "Completeness" above: 15 sensors that always return HTTP 500, the CPCB/"N/A" feeds that end early,
+  and sensors with genuine gaps or no data. The pipeline reports these; it cannot create data the API does not provide.
+* **Deep-page slowness is avoided, not removed.** The API still paginates by offset. 30-day slices keep every request to a
+  few pages, but a sensor reporting far more than ~3,000 readings per 30 days would need smaller slices.
 * **Attribution smear.** Because a reading is attributed to the local hour in which it *starts*, UTC-aligned hourly
   sensors (local `:30`) are shifted by up to 30 minutes within their hour.
 * **Gold recompute cost.** Gold is recomputed in full on every run, so its cost scales with total Silver rows.
 * **Keep-earliest deduplication.** A later source-side correction of an already-loaded value is classified as a
-  duplicate (visible via `value_differs`) and the original value is kept.
+  duplicate (visible via `value_differs`) and the original value is kept. None occurred in this dataset.
+* **Fail-fast slices.** If one slice of a sensor fails after all retries, the sensor's remaining slices are not requested
+  in that run (bounding the cost of always-failing sensors); a rerun with `--sensor-id` picks them up.
 * **Single country and parameter.** The pipeline is parameterised for India / PM2.5 only; location-level, not city-level.
 * **No CI yet.** Tests are run locally.
 
 ## Future improvements
 
-* Treat `408` as retryable and add a test for it.
 * Recompute Gold only for sensors touched by a run.
 * Fetch sensors in parallel within the API rate limit.
+* Adapt slice size to observed row density.
 * Persist provider freshness as a time series and alert on failed runs.
 * City-level aggregation once a trustworthy geographic lookup exists.
 * Continuous integration running the test suite against a Postgres service container.

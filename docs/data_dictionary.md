@@ -195,12 +195,12 @@ PK `(sensor_id, local_date)`.
 | run_id | uuid NN | FK → pipeline_runs |
 | endpoint | text NN | `locations` or `sensors/<id>/measurements` |
 | sensor_id, parameter_id, page | bigint, smallint, integer | NULL for the discovery call |
-| request_window_from, request_window_to | timestamptz | |
+| request_window_from, request_window_to | timestamptz | The window requested by this call. For sensor requests this is one 30-day slice (a slice after the first starts one hour early), not the run's overall window |
 | request_url | text NN | Never contains the API key |
 | attempt_no | integer NN | 1 = first try |
 | started_at, finished_at | timestamptz NN | |
 | duration_ms | integer | |
-| outcome | text NN | `SUCCESS`, `HTTP_5XX`, `HTTP_4XX`, `RATE_LIMITED`, `TIMEOUT`, `NETWORK_ERROR`, `INVALID_RESPONSE` |
+| outcome | text NN | `SUCCESS`, `HTTP_5XX`, `HTTP_4XX`, `RATE_LIMITED`, `TIMEOUT` (a client-side timeout or an HTTP 408; the status is kept in `http_status`), `NETWORK_ERROR`, `INVALID_RESPONSE` |
 | http_status, rows_returned | integer | |
 | error_type, error_message | text | Redacted |
 | backoff_seconds | numeric | Sleep before the next retry |
