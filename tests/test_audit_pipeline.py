@@ -421,3 +421,18 @@ def test_a_lone_sensor_stopping_is_not_called_a_provider_outage(pdb):
     why = {(s, d): w for s, d, w in q(pdb, "SELECT sensor_id, local_date, no_data_reason FROM audit.v_no_data_reason")}
     assert why[(401, date(2026, 10, 3))] == "SENSOR_STOPPED_DELIVERING"
     assert why[(201, date(2026, 10, 3))] == "PROVIDER_STOPPED_DELIVERING"          # two PROV2 sensors: provider-wide
+
+
+def test_a_sensor_that_times_out_once_with_408_is_fetched_not_failed(pdb):
+    """Regression for the 90-day run: a 408 on a deep page used to end the sensor's fetch early."""
+    from tests.fake_openaq import Script
+    locations, sensors = fleet()
+    sensors[101] = Script([408, sensors[101]])                       # first request times out, the retry succeeds
+    r, _, _ = go((locations, sensors))
+    assert r["status"] == "SUCCESS"
+    st = rows(pdb, "SELECT status, http_attempts, rows_fetched FROM audit.sensor_fetch_status "
+                   "WHERE run_id=%s AND sensor_id=101", (r["run_id"],))[0]
+    assert (st["status"], st["http_attempts"], st["rows_fetched"]) == ("FETCHED", 2, 3)
+    att = rows(pdb, "SELECT outcome, http_status FROM audit.fetch_attempts WHERE run_id=%s AND sensor_id=101 ORDER BY attempt_no", (r["run_id"],))
+    assert [(a["outcome"], a["http_status"]) for a in att] == [("TIMEOUT", 408), ("SUCCESS", 200)]
+    assert r["failed_sensor_count"] == 1                             # only the genuinely failing sensor 105

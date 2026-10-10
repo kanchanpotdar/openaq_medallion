@@ -39,7 +39,7 @@ class OpenAQClient:
 
     def get(self, path: str, params: dict | None = None, ctx: dict | None = None) -> tuple[dict, str]:
         """GET with retry. Returns (json, final_url); the url is our lineage record.
-        Retries: 5xx, 429, timeouts, network errors, unparseable bodies. 4xx (other than 429) is not retried."""
+        Retries: 5xx, 408, 429, timeouts, network errors, unparseable bodies. Other 4xx are not retried."""
         url = f"{BASE_URL}/{path.lstrip('/')}"
         shown_url = requests.Request("GET", url, params=params).prepare().url
         last = dict(outcome="NETWORK_ERROR", http_status=None, message="no attempt made")
@@ -52,6 +52,11 @@ class OpenAQClient:
                 status = resp.status_code
                 if status == 429:
                     outcome, floor = "RATE_LIMITED", self._reset_seconds(resp, 30)
+                elif status == 408:
+                    # Server-reported request timeout: transient, so treated like a client-side timeout
+                    # (retried), with the HTTP status still recorded. Deep result pages can hit this.
+                    outcome, err_type = "TIMEOUT", "HTTP 408"
+                    err_msg = getattr(resp, "reason", None) or "HTTP 408"
                 elif status >= 500:
                     outcome = "HTTP_5XX"
                 elif status >= 400:

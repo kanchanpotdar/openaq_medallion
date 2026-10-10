@@ -111,3 +111,23 @@ def test_pagination_stops_on_a_short_page_and_reports_each_page():
     assert [len(r) for r, _ in pages] == [2, 2, 1]                       # a short last page ends the walk
     assert [a["ctx"]["page"] for a in attempts] == [1, 2, 3]
     assert [a["rows_returned"] for a in attempts] == [2, 2, 1]
+
+
+def test_http_408_is_a_retried_timeout_not_a_final_client_error():
+    """408 Request Timeout is the server giving up on a slow (deep-page) request: transient, so it is retried like
+    any timeout. Found in the 90-day run, where it ended four sensors' fetches early."""
+    client, _, attempts, sleeps = make(Script([408, 408, [item("2026-10-02T03:00:00Z")]]))
+    body, _ = fetch(client)
+    assert len(body["results"]) == 1
+    assert [(a["attempt_no"], a["outcome"], a["http_status"], a["is_final"]) for a in attempts] == [
+        (1, "TIMEOUT", 408, False), (2, "TIMEOUT", 408, False), (3, "SUCCESS", 200, True)]
+    assert attempts[0]["error_type"] == "HTTP 408" and sleeps == [2, 4]
+
+
+def test_a_408_that_never_clears_is_still_a_recorded_failure_after_all_retries():
+    client, session, attempts, sleeps = make(408)
+    with pytest.raises(FetchError) as e:
+        fetch(client)
+    assert (e.value.outcome, e.value.http_status, e.value.attempts) == ("TIMEOUT", 408, 5)
+    assert [a["attempt_no"] for a in attempts] == [1, 2, 3, 4, 5] and attempts[-1]["is_final"]
+    assert len(session.sensor_calls(7)) == 5 and sleeps == [2, 4, 8, 16]
