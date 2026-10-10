@@ -30,11 +30,31 @@ class Script:
         return step
 
 
+def _t(iso):
+    from datetime import datetime
+    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+
+
+def in_window(item_, a, b, semantics):
+    """Whether a measurement is returned for a request window (a, b), under a hypothetical API boundary rule.
+    The real rule is not documented, so the slicing tests run against every plausible one."""
+    pf, pt = _t(item_["period"]["datetimeFrom"]["utc"]), _t(item_["period"]["datetimeTo"]["utc"])
+    a, b = _t(a), _t(b)
+    return {
+        "end_in":          a < pt <= b,      # period END inside (a, b]
+        "start_in":        a <= pf < b,      # period START inside [a, b)
+        "overlap":         pf < b and pt > a,
+        "end_exclusive":   a < pt < b,       # worst case: an end exactly on either boundary is excluded
+        "start_exclusive": a < pf < b,       # worst case: a start exactly on either boundary is excluded
+    }[semantics]
+
+
 class FakeSession:
-    def __init__(self, locations, sensors=None):
+    def __init__(self, locations, sensors=None, semantics=None):
         self.headers = {}
         self.locations = locations
         self.sensors = sensors or {}
+        self.semantics = semantics          # None = ignore the requested window (the original behaviour)
         self.calls = []
 
     def get(self, url, params=None, timeout=None):
@@ -48,6 +68,8 @@ class FakeSession:
         if not m:
             return FakeResponse(404, {}, url=full, reason="Not Found")
         behaviour = self.sensors.get(int(m.group(1)), [])
+        if callable(behaviour):             # a function of the request params, e.g. "fail only for this slice"
+            behaviour = behaviour(params)
         if isinstance(behaviour, Script):
             behaviour = behaviour.next()
         if isinstance(behaviour, BaseException):
@@ -56,6 +78,8 @@ class FakeSession:
             return FakeResponse(200, BAD_JSON, url=full)
         if isinstance(behaviour, int):
             return FakeResponse(behaviour, {"message": "scripted"}, url=full, reason=f"scripted {behaviour}")
+        if self.semantics and "datetime_from" in params:
+            behaviour = [it for it in behaviour if in_window(it, params["datetime_from"], params["datetime_to"], self.semantics)]
         limit, page = int(params.get("limit", 1000)), int(params.get("page", 1))
         return FakeResponse(200, {"results": behaviour[(page - 1) * limit: page * limit]}, url=full)
 

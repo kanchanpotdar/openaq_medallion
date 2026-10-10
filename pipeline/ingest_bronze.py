@@ -25,6 +25,24 @@ PM25_PARAMETER_ID = 2
 TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 ISO_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
+# The API paginates by offset, so deep pages of a long window get slow and eventually time out (HTTP 408). Each
+# sensor's window is therefore fetched in slices of at most SLICE_DAYS, which keeps every request shallow.
+# A slice after the first starts SLICE_OVERLAP early so a period that straddles a boundary can never fall between
+# two slices whatever the API's inclusive/exclusive rule is; the overlap re-fetches identical rows, which the
+# content hash skips (so no duplicate Bronze row).
+SLICE_DAYS = 30
+SLICE_OVERLAP = timedelta(hours=1)
+
+
+def time_slices(window_from: datetime, window_to: datetime, days: int = SLICE_DAYS) -> list[tuple[datetime, datetime]]:
+    """Consecutive, non-overlapping [start, end) slices of at most `days` days that exactly cover the window."""
+    out, start, step = [], window_from, timedelta(days=days)
+    while start < window_to:
+        end = min(start + step, window_to)
+        out.append((start, end))
+        start = end
+    return out
+
 SENSOR_COLS = ["sensor_id", "sensor_name", "parameter_id", "parameter_name", "units",
                "location_id", "location_name", "locality", "provider_name", "country_code",
                "timezone", "latitude", "longitude", "is_monitor", "is_mobile",
@@ -139,6 +157,9 @@ def run_window(conn, client: OpenAQClient, run_id, window_from: datetime, window
                limit_sensors: int | None = None, sensor_ids: list[str] | None = None, audit=None) -> dict:
     """Ingest [window_from, window_to) into Bronze under `run_id`.
 
+    Each sensor is fetched in time slices (see time_slices); a slice that fails after all retries fails the sensor and
+    the sensor's remaining slices are not requested. Rows already present (same hash) are skipped.
+
     Only FetchError (a request that could not be completed even after retries) is treated as a per-sensor
     failure: it is recorded and the run continues. Anything else - a database error, a bug - propagates
     and fails the run. If `audit` is given, every sensor ends with a row in audit.sensor_fetch_status."""
@@ -182,26 +203,32 @@ def run_window(conn, client: OpenAQClient, run_id, window_from: datetime, window
     if audit:
         audit.seed_sensor_status(seed)
 
+    slices = time_slices(window_from, window_to)
+    stats["slices"] = len(slices)
     observed_from, observed_to = None, None
     for n, sid in enumerate(todo, 1):
         sensor = dict(rows=0, pages=0, first=None, last=None)
+        sl = (window_from, window_to)
         try:
-            for results, url in client.pages(f"sensors/{sid}/measurements",
-                                             {"datetime_from": wf, "datetime_to": wt},
-                                             ctx={"sensor_id": sid, "parameter_id": PM25_PARAMETER_ID,
-                                                  "window_from": window_from, "window_to": window_to}):
-                rows = [measurement_row(sid, it, url, run_id) for it in results]
-                ins, skip = load_chunk(conn, "bronze.measurements", MEAS_COLS, rows)
-                stats["meas_rows_fetched"] += len(rows)
-                stats["meas_rows_inserted"] += ins
-                stats["meas_rows_skipped"] += skip
-                sensor["rows"] += len(rows)
-                sensor["pages"] += 1
-                for r in rows:
-                    if r["period_from_raw"] and ISO_Z.match(r["period_from_raw"]):
-                        sensor["first"] = min(sensor["first"] or r["period_from_raw"], r["period_from_raw"])
-                    if r["period_to_raw"] and ISO_Z.match(r["period_to_raw"]):
-                        sensor["last"] = max(sensor["last"] or r["period_to_raw"], r["period_to_raw"])
+            for s_start, s_end in slices:
+                # fetch window for this slice (the first slice starts exactly at window_from)
+                sl = (max(window_from, s_start - SLICE_OVERLAP), s_end)
+                for results, url in client.pages(f"sensors/{sid}/measurements",
+                                                 {"datetime_from": sl[0].strftime(TS_FMT), "datetime_to": sl[1].strftime(TS_FMT)},
+                                                 ctx={"sensor_id": sid, "parameter_id": PM25_PARAMETER_ID,
+                                                      "window_from": sl[0], "window_to": sl[1]}):
+                    rows = [measurement_row(sid, it, url, run_id) for it in results]
+                    ins, skip = load_chunk(conn, "bronze.measurements", MEAS_COLS, rows)
+                    stats["meas_rows_fetched"] += len(rows)
+                    stats["meas_rows_inserted"] += ins
+                    stats["meas_rows_skipped"] += skip
+                    sensor["rows"] += len(rows)
+                    sensor["pages"] += 1
+                    for r in rows:
+                        if r["period_from_raw"] and ISO_Z.match(r["period_from_raw"]):
+                            sensor["first"] = min(sensor["first"] or r["period_from_raw"], r["period_from_raw"])
+                        if r["period_to_raw"] and ISO_Z.match(r["period_to_raw"]):
+                            sensor["last"] = max(sensor["last"] or r["period_to_raw"], r["period_to_raw"])
             stats["attempted_sensors"] += 1
             if sensor["rows"]:
                 stats["fetched_sensors"] += 1
@@ -218,9 +245,10 @@ def run_window(conn, client: OpenAQClient, run_id, window_from: datetime, window
         except FetchError as exc:       # recorded, and the run goes on; the failure RATE is reconciled later
             stats["attempted_sensors"] += 1
             stats["failed_sensors"].append(str(sid))
-            log.error("sensor %s failed: %s", sid, exc)
+            reason = f"{exc} [slice {sl[0].strftime(TS_FMT)} -> {sl[1].strftime(TS_FMT)}]"
+            log.error("sensor %s failed: %s", sid, reason)
             if audit:
-                audit.sensor_done(sid, status="FAILED", reason=str(exc), rows=sensor["rows"], pages=sensor["pages"],
+                audit.sensor_done(sid, status="FAILED", reason=reason, rows=sensor["rows"], pages=sensor["pages"],
                                   first=sensor["first"], last=sensor["last"],
                                   http_status=exc.http_status, error_type=exc.outcome, error_message=str(exc))
         if n % 25 == 0:

@@ -40,7 +40,7 @@ def fleet():
 def go(api=None, **kw):
     """Run the real pipeline against the fake API in the test database. Returns (result, session, sleeps)."""
     locations, sensors = api or fleet()
-    session = FakeSession(locations, sensors)
+    session = FakeSession(locations, sensors, semantics=kw.pop("semantics", None))
     sleeps = []
     client = OpenAQClient(KEY, session=session, sleep=sleeps.append)
     args = dict(window_from=W0, window_to=W1, dbname=helpers.TEST_DB, sensor_ids=IDS, max_failed_fraction=0.2,
